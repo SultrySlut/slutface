@@ -19,14 +19,14 @@ local Mouse       = LocalPlayer:GetMouse()
 --// Configuration
 local Config = {
     FOVSize          = 300,
-    ShowGUI          = true,
-    ShowESP          = true,
-    ShowHighlight    = true,
-    DISTANCE_CLOSE   = 744,
+    ShowGUI          = false,
+    ShowESP          = false,
+    ShowHighlight    = false,
+    DISTANCE_CLOSE   = 74,
     DISTANCE_MEDIUM  = 149,
     DISTANCE_FAR     = 299,
     TRIGGER_KEYWORD  = "Kaidee",
-    WallBang         = true   -- when false, will only target players you can see
+    WallBang         = false   -- when false, will only target players you can see
 }
 
 --// State variables
@@ -53,7 +53,7 @@ local UI = {}
 --  Drawing – FOV circle
 --============================================================
 local FOV = Drawing.new("Circle")
-FOV.Visible       = true
+FOV.Visible       = false
 FOV.Filled        = false
 FOV.Transparency  = 0.5
 FOV.Color         = Color3.new(0.000000, 0.101961, 1.000000)
@@ -184,14 +184,14 @@ local function SetupPlayerTracking()
 end
 
 --============================================================
---  Target acquisition (fixed)
+--  Target acquisition
 --============================================================
 local function NearestToCursor()
     local mVec           = Vector2.new(Mouse.X, Mouse.Y)
     local bestPlayer     = nil
     local bestDistPixels = math.huge
     local bestPart
-
+    
     for player, char in pairs(State.Characters) do
         if player ~= LocalPlayer and State.Whitelist[player] ~= false and char then
             local part = char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
@@ -199,33 +199,46 @@ local function NearestToCursor()
                 local v, onScreen = CurrentCamera:WorldToViewportPoint(part.Position)
                 if onScreen then
                     local pixDist = (mVec - Vector2.new(v.X, v.Y)).Magnitude
-
-                    -- line‑of‑sight check
+                    
                     local camPos = CurrentCamera.CFrame.Position
                     local toPart = (part.Position - camPos)
-                    local canSee = true
                     if not Config.WallBang then
                         local rp = RaycastParams.new()
                         rp.FilterDescendantsInstances = {LocalPlayer.Character}
                         rp.FilterType = Enum.RaycastFilterType.Blacklist
                         local result = workspace:Raycast(camPos, toPart, rp)
                         if not (result and result.Instance:IsDescendantOf(char)) then
-                            canSee = false
+                            -- something else (a wall) blocks the view → skip this player
+                            continue
                         end
                     end
-
-                    -- only pick them if visible (or wall‑bang is on), inside FOV, and closer than previous best
-                    if canSee and pixDist <= Config.FOVSize and pixDist < bestDistPixels then
+                    
+                    if pixDist <= Config.FOVSize and pixDist < bestDistPixels then
                         bestPlayer, bestPart, bestDistPixels = player, part, pixDist
                     end
                 end
             end
         end
     end
-
+    
     return bestPlayer, bestPart
 end
 
+--============================================================
+--  Metamethod / function hooks
+--============================================================
+local Hooks = {OldMeta = {}}
+
+Hooks.OldMeta.__index = hookmetamethod(game, "__index", function(self, idx)
+    if State.HookActive and State.TargetPart and self == Mouse and not checkcaller() then
+        if idx == "Target" or idx == "target" then return State.TargetPart end
+        if idx == "Hit"    or idx == "hit"    then
+            local cf = State.TargetPart.CFrame + State.RandomOffset
+            return cf
+        end
+    end
+    return Hooks.OldMeta.__index(self, idx)
+end)
 
 --============================================================
 --  Highlight handling

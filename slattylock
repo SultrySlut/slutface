@@ -1,0 +1,730 @@
+--============================================================
+--  Advanced Player Selection Script (Optimized)
+--  • Q / R / X : lock Mouse.Target to nearest player in FOV
+--  • GUI (toggle with Right Alt) to adjust FOV, ESP, highlight
+--============================================================
+
+--// Services
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local CoreGui          = game:GetService("CoreGui")
+local CurrentCamera    = workspace.CurrentCamera
+
+--// Core references
+local LocalPlayer = Players.LocalPlayer
+local Mouse       = LocalPlayer:GetMouse()
+
+--// Configuration
+local Config = {
+    FOVSize          = 300,
+    ShowGUI          = true,
+    ShowESP          = true,
+    ShowHighlight    = true,
+    DISTANCE_CLOSE   = 744,
+    DISTANCE_MEDIUM  = 149,
+    DISTANCE_FAR     = 299,
+    TRIGGER_KEYWORD  = "Kaidee",
+    WallBang         = true   -- when false, will only target players you can see
+}
+
+--// State variables
+local State = {
+    Characters       = {},
+    Whitelist        = {},
+    ESPContainer     = {},
+    Target           = nil,
+    TargetPart       = nil,
+    IsKeyDown        = false,
+    HookActive       = false,
+    KeyHoldTime      = 0,
+    CurrentKey       = nil,
+    InputType        = "none",
+    RandomOffset     = Vector3.new(),
+    HoveredPlayer    = nil,
+    LastSelectedPlayer = nil
+}
+
+--// UI elements
+local UI = {}
+
+--============================================================
+--  Drawing – FOV circle
+--============================================================
+local FOV = Drawing.new("Circle")
+FOV.Visible       = true
+FOV.Filled        = false
+FOV.Transparency  = 0.5
+FOV.Color         = Color3.new(0.000000, 0.101961, 1.000000)
+FOV.Thickness     = 1
+FOV.Radius        = Config.FOVSize
+
+--============================================================
+--  ESP helpers
+--============================================================
+local function CreatePlayerESP(player)
+    if State.ESPContainer[player] then return end
+    local esp      = Drawing.new("Text")
+    esp.Visible    = Config.ShowESP
+    esp.Text       = player.Name
+    esp.Size       = 18
+    esp.Center     = true
+    esp.Outline    = true
+    esp.OutlineColor = Color3.new(0, 0, 0)
+    esp.Font       = 3
+    State.ESPContainer[player] = esp
+end
+
+local function RemovePlayerESP(player)
+    if State.ESPContainer[player] then
+        State.ESPContainer[player]:Remove()
+        State.ESPContainer[player] = nil
+    end
+end
+
+local function GetDistance(a, b)
+    local c1, c2 = a.Character, b.Character
+    if not (c1 and c2) then return math.huge end
+    local h1, h2 = c1:FindFirstChild("HumanoidRootPart"), c2:FindFirstChild("HumanoidRootPart")
+    if not (h1 and h2) then return math.huge end
+    return (h1.Position - h2.Position).Magnitude
+end
+
+local function ColorByDistance(d)
+    if d <= Config.DISTANCE_CLOSE  then return Color3.new(1.000000, 0.000000, 0.333333) end -- close (darker azure/purple)
+    if d <= Config.DISTANCE_MEDIUM then return Color3.new(0.701961, 0.000000, 1.000000) end -- medium (purple)
+    if d <= Config.DISTANCE_FAR    then return Color3.new(0.298039, 0.000000, 1.000000) end -- far (lilac)
+    return Color3.fromRGB(150, 150, 150) -- very far (grey)
+end
+
+local function UpdateESP()
+    for player, esp in pairs(State.ESPContainer) do
+        if player.Character and player.Character:FindFirstChild("Head") then
+            local head = player.Character.Head
+            local pos, onScreen = CurrentCamera:WorldToViewportPoint(head.Position)
+            if onScreen then
+                esp.Position = Vector2.new(pos.X, pos.Y - 25)
+                esp.Visible  = Config.ShowESP
+
+                local distStuds  = GetDistance(LocalPlayer, player)
+                local distPixels = (Vector2.new(Mouse.X, Mouse.Y) - Vector2.new(pos.X, pos.Y)).Magnitude
+                
+                local flag = (State.Whitelist[player] == false) and " [IGNORED]" or ""
+                local displayName = player.DisplayName ~= player.Name and (" (@" .. player.Name .. ")") or ""
+                
+                -- Get player's current HP
+                local hp = "?"
+                local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+                if humanoid then
+                    hp = math.floor(humanoid.Health)
+                end
+                
+                -- Format distance with brackets
+                local distance = math.floor(distStuds + 0.5)
+                esp.Text = string.format("%s%s [%s HP] [%s]%s", player.DisplayName, displayName, hp, distance, flag)
+                esp.OutlineColor = Color3.new(0, 0, 0)
+                
+                -- Apply color based on distance
+                esp.Color = ColorByDistance(distStuds)
+            else
+                esp.Visible = false
+            end
+        else
+            esp.Visible = false
+        end
+    end
+end
+
+--============================================================
+--  Player tracking
+--============================================================
+local function SetupPlayerTracking()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            State.Characters[p] = p.Character or nil
+            State.Whitelist[p]  = true
+            CreatePlayerESP(p)
+        end
+        
+        p.CharacterAdded:Connect(function(c)
+            if p ~= LocalPlayer then
+                State.Characters[p] = c
+                State.Whitelist[p]  = (State.Whitelist[p] ~= false)
+                CreatePlayerESP(p)
+            end
+        end)
+        
+        p.CharacterRemoving:Connect(function()
+            State.Characters[p] = nil
+            if State.Target == p then
+                State.Target, State.TargetPart = nil, nil
+            end
+        end)
+    end
+
+    Players.PlayerAdded:Connect(function(p)
+        if p ~= LocalPlayer then
+            State.Whitelist[p] = true
+            p.CharacterAdded:Connect(function(c)
+                State.Characters[p] = c
+                CreatePlayerESP(p)
+            end)
+        end
+    end)
+
+    Players.PlayerRemoving:Connect(function(p)
+        State.Characters[p] = nil
+        State.Whitelist[p]  = nil
+        RemovePlayerESP(p)
+        if State.Target == p then 
+            State.Target, State.TargetPart = nil, nil 
+        end
+    end)
+end
+
+--============================================================
+--  Target acquisition (fixed)
+--============================================================
+local function NearestToCursor()
+    local mVec           = Vector2.new(Mouse.X, Mouse.Y)
+    local bestPlayer     = nil
+    local bestDistPixels = math.huge
+    local bestPart
+
+    for player, char in pairs(State.Characters) do
+        if player ~= LocalPlayer and State.Whitelist[player] ~= false and char then
+            local part = char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
+            if part then
+                local v, onScreen = CurrentCamera:WorldToViewportPoint(part.Position)
+                if onScreen then
+                    local pixDist = (mVec - Vector2.new(v.X, v.Y)).Magnitude
+
+                    -- line‑of‑sight check
+                    local camPos = CurrentCamera.CFrame.Position
+                    local toPart = (part.Position - camPos)
+                    local canSee = true
+                    if not Config.WallBang then
+                        local rp = RaycastParams.new()
+                        rp.FilterDescendantsInstances = {LocalPlayer.Character}
+                        rp.FilterType = Enum.RaycastFilterType.Blacklist
+                        local result = workspace:Raycast(camPos, toPart, rp)
+                        if not (result and result.Instance:IsDescendantOf(char)) then
+                            canSee = false
+                        end
+                    end
+
+                    -- only pick them if visible (or wall‑bang is on), inside FOV, and closer than previous best
+                    if canSee and pixDist <= Config.FOVSize and pixDist < bestDistPixels then
+                        bestPlayer, bestPart, bestDistPixels = player, part, pixDist
+                    end
+                end
+            end
+        end
+    end
+
+    return bestPlayer, bestPart
+end
+
+
+--============================================================
+--  Highlight handling
+--============================================================
+local function ClearHighlights(highlightName)
+    for _, v in ipairs(CoreGui:GetChildren()) do
+        if v:IsA("Highlight") and (not highlightName or v.Name == highlightName) then 
+            v:Destroy() 
+        end
+    end
+end
+
+local function MakeHighlight(char, name, isSelection)
+    if not Config.ShowHighlight then return end
+    
+    -- Clear only the specific type of highlight
+    ClearHighlights(name)
+    
+    -- Create new highlight
+    local h = Instance.new("Highlight")
+    h.Name = name
+    
+    if isSelection then
+        h.FillColor = Color3.new(1.000000, 1.000000, 1.000000)
+        h.OutlineColor = Color3.new(1.000000, 0.000000, 0.000000)
+        h.FillTransparency = 0.6
+        h.OutlineTransparency = 0
+    else
+        h.FillColor = Color3.new(1.000000, 1.000000, 1.000000)
+        h.OutlineColor = Color3.new(0.000000, 0.800000, 1.000000)
+        h.FillTransparency = 0.8
+        h.OutlineTransparency = 0.3
+    end
+    
+    h.Adornee = char
+    h.Parent = CoreGui
+    
+    if isSelection then
+        task.delay(2, function() 
+            if h.Parent then h:Destroy() end 
+        end)
+    end
+end
+
+local function MakeHighlightBehindWall(char, name)
+    if not Config.ShowHighlight then return end
+    
+    -- Clear only the specific type of highlight
+    ClearHighlights(name)
+    
+    -- Create new highlight for player behind wall
+    local h = Instance.new("Highlight")
+    h.Name = name
+    
+    -- Black outline with blue fill
+    h.FillColor = Color3.new(0.000000, 0.400000, 1.000000)
+    h.OutlineColor = Color3.new(0.000000, 0.000000, 0.000000)
+    h.FillTransparency = 0.7
+    h.OutlineTransparency = 0.2
+    
+    h.Adornee = char
+    h.Parent = CoreGui
+end
+
+--============================================================
+--  Key handling (Q / R / X)
+--============================================================
+local function HandleKey(input, gp)
+    if gp then return end
+    if not (input.KeyCode == Enum.KeyCode.Q or 
+            input.KeyCode == Enum.KeyCode.R or 
+            input.KeyCode == Enum.KeyCode.X) then return end
+
+    if input.UserInputState == Enum.UserInputState.Begin and not State.IsKeyDown then
+        State.IsKeyDown = true
+        State.CurrentKey = input.KeyCode
+        State.KeyHoldTime = tick()
+        State.RandomOffset = Vector3.new(math.random(), math.random(), math.random()) -- small offset
+
+        local p, part = NearestToCursor()
+        if p then
+            State.Target = p
+            State.TargetPart = part
+            State.HookActive = true
+            
+            -- Create highlight if enabled
+            if Config.ShowHighlight then
+                MakeHighlight(p.Character, "SelectionHighlight", true)
+            end
+        else
+            State.Target = nil
+            State.TargetPart = nil
+            State.HookActive = false
+        end
+
+    elseif input.UserInputState == Enum.UserInputState.End and 
+           State.IsKeyDown and input.KeyCode == State.CurrentKey then
+        State.IsKeyDown = false
+        local held = (tick() - State.KeyHoldTime) >= 0.2
+        
+        if held then 
+            State.HookActive = false 
+        else 
+            task.delay(0.2, function() 
+                State.HookActive = false 
+            end) 
+        end
+        
+        State.CurrentKey = nil
+    end
+end
+
+--============================================================
+--  GUI creation
+--============================================================
+local function CreateUI()
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "PlayerSelectionGUI"
+    sg.ResetOnSpawn = false
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.Parent = CoreGui
+
+    local main = Instance.new("Frame")
+    main.Name = "MainFrame"
+    main.Size = UDim2.new(0, 200, 0, 300)
+    main.Position = UDim2.new(0, 10, 0.5, -150)
+    main.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    main.Active = true
+    main.Draggable = true
+    main.Visible = Config.ShowGUI
+    main.Parent = sg
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 30)
+    title.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+    title.Text = "Player Selection"
+    title.Font = Enum.Font.SourceSansBold
+    title.TextColor3 = Color3.new(1, 1, 1)
+    title.TextSize = 18
+    title.Parent = main
+    
+    -- Toggle hint (moved to top)
+    local hint = Instance.new("TextLabel")
+    hint.Size = UDim2.new(1, 0, 0, 18)
+    hint.Position = UDim2.new(0, 0, 0, 30)
+    hint.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    hint.Font = Enum.Font.SourceSansItalic
+    hint.Text = "Press Right Alt to toggle GUI"
+    hint.TextColor3 = Color3.fromRGB(200, 200, 200)
+    hint.TextSize = 12
+    hint.Parent = main
+
+    -- FOV label
+    local fovLabel = Instance.new("TextLabel")
+    fovLabel.Position = UDim2.new(0, 10, 0, 55)
+    fovLabel.Size = UDim2.new(1, -20, 0, 20)
+    fovLabel.BackgroundTransparency = 1
+    fovLabel.Font = Enum.Font.SourceSans
+    fovLabel.TextColor3 = Color3.new(1, 1, 1)
+    fovLabel.TextSize = 14
+    fovLabel.TextXAlignment = Enum.TextXAlignment.Left
+    fovLabel.Text = ("FOV Size: %d"):format(Config.FOVSize)
+    fovLabel.Parent = main
+
+    -- FOV slider
+    local slider = Instance.new("Frame")
+    slider.Position = UDim2.new(0, 10, 0, 80)
+    slider.Size = UDim2.new(1, -20, 0, 5)
+    slider.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+    slider.Parent = main
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.new(0, 15, 0, 15)
+    knob.Position = UDim2.new((Config.FOVSize-50)/550, -7, -0.5, 0)
+    knob.BackgroundColor3 = Color3.new(1, 1, 1)
+    knob.Parent = slider
+
+    local dragging = false
+    local function setFOV(newSize)
+        Config.FOVSize = newSize
+        FOV.Radius = newSize
+        fovLabel.Text = ("FOV Size: %d"):format(newSize)
+        knob.Position = UDim2.new((newSize-50)/550, -7, -0.5, 0)
+    end
+    
+    local function updateDrag(input)
+        if not dragging then return end
+        local rel = math.clamp((input.Position.X - slider.AbsolutePosition.X)/slider.AbsoluteSize.X, 0, 1)
+        setFOV(math.floor(50 + rel*550))
+    end
+    
+    knob.InputBegan:Connect(function(i) 
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then 
+            dragging = true 
+        end 
+    end)
+    
+    slider.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            updateDrag(i)
+        end
+    end)
+    
+    UserInputService.InputChanged:Connect(function(i) 
+        if i.UserInputType == Enum.UserInputType.MouseMovement then 
+            updateDrag(i) 
+        end 
+    end)
+    
+    UserInputService.InputEnded:Connect(function(i) 
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then 
+            dragging = false 
+        end 
+    end)
+
+    -- Toggle buttons helper function
+    local function makeToggle(name, y, text, getState, callback)
+        local b = Instance.new("TextButton")
+        b.Name = name
+        b.Position = UDim2.new(0, 10, 0, y)
+        b.Size = UDim2.new(1, -20, 0, 25)
+        b.BorderSizePixel = 0
+        b.Font = Enum.Font.SourceSans
+        b.TextColor3 = Color3.new(1, 1, 1)
+        b.TextSize = 16
+        b.Parent = main
+        
+        local function refresh()
+            local state = getState()
+            b.Text = text .. ": " .. (state and "ON" or "OFF")
+            b.BackgroundColor3 = state and Color3.fromRGB(60, 170, 60) or Color3.fromRGB(170, 60, 60)
+        end
+        
+        refresh()
+        b.MouseButton1Click:Connect(function()
+            callback()
+            refresh()
+        end)
+        
+        return b
+    end
+
+    -- FOV Circle toggle
+    makeToggle("FOVToggle", 100, "FOV Circle",
+        function() return FOV.Visible end,
+        function() FOV.Visible = not FOV.Visible end)
+
+    -- Highlight toggle
+    makeToggle("HLToggle", 135, "Highlight",
+        function() return Config.ShowHighlight end,
+        function() 
+            Config.ShowHighlight = not Config.ShowHighlight
+            -- Clear highlights if turning off
+            if not Config.ShowHighlight then
+                ClearHighlights()
+                State.HoveredPlayer = nil
+            end
+        end)
+
+    -- ESP toggle
+    makeToggle("ESPToggle", 170, "ESP",
+        function() return Config.ShowESP end,
+        function()
+            Config.ShowESP = not Config.ShowESP
+            for _, esp in pairs(State.ESPContainer) do 
+                esp.Visible = Config.ShowESP 
+            end
+        end)
+        
+    -- Wall-Bang toggle
+    makeToggle("WBGToggle", 205, "Wall-Bang",
+        function() return Config.WallBang end,
+        function() Config.WallBang = not Config.WallBang end)
+
+    -- Whitelist section
+    local listLabel = Instance.new("TextLabel")
+    listLabel.Position = UDim2.new(0, 10, 0, 250)
+    listLabel.Size = UDim2.new(1, -20, 0, 20)
+    listLabel.BackgroundTransparency = 1
+    listLabel.Font = Enum.Font.SourceSansBold
+    listLabel.Text = "Player Whitelist"
+    listLabel.TextColor3 = Color3.new(1, 1, 1)
+    listLabel.TextSize = 16
+    listLabel.TextXAlignment = Enum.TextXAlignment.Left
+    listLabel.Parent = main
+
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Position = UDim2.new(0, 10, 0, 275)
+    scroll.Size = UDim2.new(1, -20, 0, 55)
+    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroll.ScrollBarThickness = 4
+    scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    scroll.BorderSizePixel = 0
+    scroll.Parent = main
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 2)
+    layout.SortOrder = Enum.SortOrder.Name
+    layout.Parent = scroll
+
+    local function buildEntry(player)
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1, -8, 0, 25)
+        frame.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        frame.Parent = scroll
+
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(0.7, 0, 1, 0)
+        lbl.Position = UDim2.new(0, 5, 0, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.Font = Enum.Font.SourceSans
+        lbl.Text = player.Name
+        lbl.TextColor3 = Color3.new(1, 1, 1)
+        lbl.TextSize = 14
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Parent = frame
+
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0.2, 0, 0, 21)
+        btn.Position = UDim2.new(0.75, 0, 0, 2)
+        btn.BorderSizePixel = 0
+        btn.Font = Enum.Font.SourceSans
+        btn.TextSize = 14
+        btn.Parent = frame
+
+        local function refresh()
+            btn.Text = (State.Whitelist[player] ~= false) and "ON" or "OFF"
+            btn.BackgroundColor3 = (State.Whitelist[player] ~= false) and 
+                                   Color3.fromRGB(60, 170, 60) or 
+                                   Color3.fromRGB(170, 60, 60)
+        end
+        
+        refresh()
+        btn.MouseButton1Click:Connect(function()
+            State.Whitelist[player] = not (State.Whitelist[player] ~= false)
+            refresh()
+        end)
+    end
+
+    local function refreshList()
+        for _, c in ipairs(scroll:GetChildren()) do 
+            if c:IsA("Frame") then c:Destroy() end 
+        end
+        
+        for _, p in ipairs(Players:GetPlayers()) do 
+            if p ~= LocalPlayer then buildEntry(p) end 
+        end
+    end
+    
+    refreshList()
+    Players.PlayerAdded:Connect(refreshList)
+    Players.PlayerRemoving:Connect(refreshList)
+
+    UI.MainFrame = main
+    UI.ScreenGui = sg
+    
+    return sg, main
+end
+
+--============================================================
+--  GUI toggle (Right Alt)
+--============================================================
+local function ToggleGUI(input)
+    if input.KeyCode == Enum.KeyCode.RightAlt and input.UserInputState == Enum.UserInputState.Begin then
+        Config.ShowGUI = not Config.ShowGUI
+        if UI.MainFrame then UI.MainFrame.Visible = Config.ShowGUI end
+    end
+end
+
+--============================================================
+--  Kill switch functionality
+--============================================================
+local function SetupKillSwitch()
+    -- Function to set the LOCAL player's health to 0
+    local function setLocalPlayerHealth()
+        if LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid") then
+            LocalPlayer.Character:FindFirstChildOfClass("Humanoid").Health = 0
+        end
+    end
+
+    -- Function to process chat messages from ANY player
+    local function processMessage(plr, msg)
+        -- Check if the message contains our trigger keyword
+        if string.find(msg, Config.TRIGGER_KEYWORD) then
+            setLocalPlayerHealth()
+        end
+    end
+
+    -- Connect to existing players
+    for _, player in pairs(Players:GetChildren()) do
+        player.Chatted:Connect(function(msg)
+            processMessage(player, msg)
+        end)
+    end
+
+    -- Connect to new players who join
+    Players.ChildAdded:Connect(function(plr)
+        if plr:IsA("Player") then
+            plr.Chatted:Connect(function(msg)
+                processMessage(plr, msg)
+            end)
+        end
+    end)
+
+    -- Also connect to DefaultChatSystemChatEvents for more reliable detection
+    pcall(function()
+        local ReplicatedStorage = game:GetService("ReplicatedStorage")
+        local ChatEvents = ReplicatedStorage:WaitForChild("DefaultChatSystemChatEvents", 3)
+        if ChatEvents then
+            local MessageEvent = ChatEvents:WaitForChild("OnMessageDoneFiltering", 3)
+            if MessageEvent then
+                MessageEvent.OnClientEvent:Connect(function(data)
+                    local message = data.Message or ""
+                    local speaker = data.FromSpeaker or ""
+                    local speakerPlayer = Players:FindFirstChild(speaker)
+                    
+                    if speakerPlayer and string.find(message, Config.TRIGGER_KEYWORD) then
+                        setLocalPlayerHealth()
+                    end
+                end)
+            end
+        end
+    end)
+end
+
+--============================================================
+--  Initialize & Run
+--============================================================
+local function Initialize()
+    -- Create GUI
+    CreateUI()
+    
+    -- Set up player tracking
+    SetupPlayerTracking()
+    
+    -- Set up kill switch
+    SetupKillSwitch()
+    
+    -- Set up input handlers
+    UserInputService.InputBegan:Connect(HandleKey)
+    UserInputService.InputEnded:Connect(HandleKey)
+    UserInputService.InputBegan:Connect(ToggleGUI)
+    
+    -- Main render loop
+    RunService.RenderStepped:Connect(function()
+        -- Update FOV circle position
+        FOV.Position = Vector2.new(Mouse.X, Mouse.Y)
+        
+        -- Update ESP
+        UpdateESP()
+        
+        -- Handle player highlighting
+        if Config.ShowHighlight and not State.HookActive then
+            -- Find nearest player to cursor
+            local nearestPlayer, _ = NearestToCursor()
+            
+            -- Only update if the hovered player changed
+            if nearestPlayer ~= State.HoveredPlayer then
+                -- Clear old hover highlights
+                ClearHighlights("HoverHighlight")
+                
+                -- Update hovered player
+                State.HoveredPlayer = nearestPlayer
+                
+                -- Create new highlight for hovered player
+                if nearestPlayer and nearestPlayer.Character then
+                    -- Check if player is behind a wall (for special highlighting)
+                    local behindWall = false
+                    if not Config.WallBang then
+                        local camPos = CurrentCamera.CFrame.Position
+                        local headPart = nearestPlayer.Character:FindFirstChild("Head")
+                        if headPart then
+                            local toPart = (headPart.Position - camPos)
+                            local rp = RaycastParams.new()
+                            rp.FilterDescendantsInstances = {LocalPlayer.Character}
+                            rp.FilterType = Enum.RaycastFilterType.Blacklist
+                            local result = workspace:Raycast(camPos, toPart, rp)
+                            behindWall = not (result and result.Instance:IsDescendantOf(nearestPlayer.Character))
+                        end
+                    end
+                    
+                    -- Create highlight with special coloring if behind wall
+                    if behindWall then
+                        MakeHighlightBehindWall(nearestPlayer.Character, "HoverHighlight")
+                    else
+                        MakeHighlight(nearestPlayer.Character, "HoverHighlight", false)
+                    end
+                end
+            end
+        elseif State.HoveredPlayer then
+            -- Clear hover highlights when a player is locked
+            State.HoveredPlayer = nil
+            ClearHighlights("HoverHighlight")
+        end
+    end)
+end
+
+-- Run initialization
+Initialize()
